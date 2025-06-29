@@ -1,0 +1,932 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Truss Analyzer</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; display: flex; margin: 0; height: 100vh; background-color: #f4f7f6; }
+        #sidebar { width: 320px; padding: 20px; background-color: #ffffff; box-shadow: 2px 0 5px rgba(0,0,0,0.1); overflow-y: auto; display: flex; flex-direction: column; }
+        #main-content { flex-grow: 1; display: flex; justify-content: center; align-items: center; padding: 20px; overflow: hidden; background-color: #e9ecef; }
+        canvas { border: 1px solid #ccc; background-color: #fff; cursor: crosshair; }
+        h2, h3 { color: #333; margin-top: 0; }
+        .control-group { margin-bottom: 20px; border-bottom: 1px solid #eee; padding-bottom: 20px; }
+        .control-group:last-child { border-bottom: none; }
+        label { font-weight: bold; font-size: 14px; color: #555; display: block; margin-bottom: 8px; }
+        .mode-btn, .toggle-btn, .action-btn { display: block; width: 100%; padding: 10px; margin-bottom: 5px; border: 1px solid #ccc; background-color: #f0f0f0; cursor: pointer; text-align: left; border-radius: 5px; font-size: 14px; box-sizing: border-box; }
+        .mode-btn.active, .toggle-btn.active { background-color: #007bff; color: white; border-color: #007bff; }
+        #btn-solve { background-color: #28a745; color: white; }
+        #btn-clear { background-color: #dc3545; color: white; }
+        .prop-input { width: 100%; padding: 8px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; margin-top: 4px; }
+        .status-message { margin-top: auto; padding: 10px; background: #e9ecef; border-radius: 5px; font-size: 13px; color: #495057; line-height: 1.5; }
+    </style>
+</head>
+<body>
+    <div id="sidebar">
+        <div>
+            <h2>Truss Analyzer</h2>
+            <div class="control-group">
+                <h3>1. Drawing Mode</h3>
+                <button id="btn-add-nodes" class="mode-btn active">Add Nodes</button>
+                <button id="btn-add-members" class="mode-btn">Add Members</button>
+                <button id="btn-delete" class="mode-btn">Delete Element</button>
+            </div>
+            <div class="control-group">
+                <h3>2. Drawing Assistants</h3>
+                <button id="btn-ortho-snap" class="toggle-btn">Ortho Snap (OFF)</button>
+            </div>
+            <div class="control-group">
+                <h3>3. Supports & Loads</h3>
+                <button id="btn-add-pinned" class="mode-btn">Set Pinned Support</button>
+                <button id="btn-add-roller" class="mode-btn">Set Roller Support</button>
+                <button id="btn-add-load" class="mode-btn">Set Load on Node</button>
+            </div>
+            <div class="control-group">
+                <h3>4. Selection</h3>
+                <button id="btn-bulk-select" class="mode-btn">Bulk Select</button>
+            </div>
+            <div class="control-group">
+                <h3>5. Analyze & Manage</h3>
+                <button id="btn-solve" class="action-btn">Solve Truss</button>
+                <button id="btn-clear" class="action-btn">Clear All</button>
+                <button id="btn-undo" class="action-btn">Undo (Ctrl+Z)</button>
+                <button id="btn-redo" class="action-btn">Redo (Ctrl+Y)</button>
+                <button id="btn-export" class="action-btn">Export Truss</button>
+                <button id="btn-import" class="action-btn">Import Truss</button>
+            </div>
+        </div>
+        <div id="status" class="status-message">
+            Ready. Click on the canvas to add a node. Use mouse wheel to zoom, middle-click to pan.
+        </div>
+    </div>
+
+    <div id="main-content">
+        <canvas id="trussCanvas"></canvas>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('trussCanvas');
+        const ctx = canvas.getContext('2d');
+        const statusEl = document.getElementById('status');
+
+        let nodes = [];
+        let members = [];
+        let supports = [];
+        let loads = [];
+        let analysisResults = null;
+        let nextNodeId = 1;
+        let mode = 'add_nodes';
+        let startMemberNode = null;
+        let isOrthoOn = false;
+        let isSelecting = false;
+        let selectionRect = null;
+        let selectedNodes = [];
+        let selectedMembers = [];
+        let isDraggingSelection = false;
+        let dragStart = null;
+        let dragOffset = null;
+        let clipboardNodes = [];
+        
+        let scale = 1.0;
+        let origin = { x: 0, y: 0 };
+        let panStart = { x: 0, y: 0 };
+        let isPanning = false;
+
+        const grid_size = 1;
+        const node_radius = 5;
+        const click_tolerance = 15;
+
+        // Undo/Redo stacks
+        let undoStack = [];
+        let redoStack = [];
+
+        let axisSelection = null;
+        let axisValue = null;
+        let previewLine = null;
+
+        function saveState() {
+            undoStack.push({
+                nodes: JSON.parse(JSON.stringify(nodes)),
+                members: JSON.parse(JSON.stringify(members)),
+                supports: JSON.parse(JSON.stringify(supports)),
+                loads: JSON.parse(JSON.stringify(loads)),
+                nextNodeId,
+                scale,
+                origin: {...origin}
+            });
+            if (undoStack.length > 100) undoStack.shift();
+            redoStack = [];
+        }
+
+        function restoreState(state) {
+            nodes = JSON.parse(JSON.stringify(state.nodes));
+            members = JSON.parse(JSON.stringify(state.members));
+            supports = JSON.parse(JSON.stringify(state.supports));
+            loads = JSON.parse(JSON.stringify(state.loads));
+            nextNodeId = state.nextNodeId;
+            scale = state.scale;
+            origin = {...state.origin};
+            analysisResults = null;
+            startMemberNode = null;
+            updateStatus();
+            draw();
+        }
+
+        function undo() {
+            if (undoStack.length > 0) {
+                const current = {
+                    nodes: JSON.parse(JSON.stringify(nodes)),
+                    members: JSON.parse(JSON.stringify(members)),
+                    supports: JSON.parse(JSON.stringify(supports)),
+                    loads: JSON.parse(JSON.stringify(loads)),
+                    nextNodeId,
+                    scale,
+                    origin: {...origin}
+                };
+                redoStack.push(current);
+                const prev = undoStack.pop();
+                restoreState(prev);
+            }
+        }
+
+        function redo() {
+            if (redoStack.length > 0) {
+                const current = {
+                    nodes: JSON.parse(JSON.stringify(nodes)),
+                    members: JSON.parse(JSON.stringify(members)),
+                    supports: JSON.parse(JSON.stringify(supports)),
+                    loads: JSON.parse(JSON.stringify(loads)),
+                    nextNodeId,
+                    scale,
+                    origin: {...origin}
+                };
+                undoStack.push(current);
+                const next = redoStack.pop();
+                restoreState(next);
+            }
+        }
+
+        document.getElementById('btn-undo').addEventListener('click', undo);
+        document.getElementById('btn-redo').addEventListener('click', redo);
+
+        document.addEventListener('keydown', function(e) {
+            if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'z') {
+                e.preventDefault(); undo();
+            } else if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'y' || (e.shiftKey && e.key.toLowerCase() === 'z'))) {
+                e.preventDefault(); redo();
+            } else if (mode === 'bulk_select' && selectedNodes.length > 0 && (e.key === 'Delete' || e.key === 'Backspace')) {
+                // Delete selected nodes and their members/supports/loads
+                saveState();
+                const selectedIds = selectedNodes.map(n => n.id);
+                nodes = nodes.filter(n => !selectedIds.includes(n.id));
+                members = members.filter(m => !selectedIds.includes(m.startNode) && !selectedIds.includes(m.endNode));
+                supports = supports.filter(s => !selectedIds.includes(s.nodeId));
+                loads = loads.filter(l => !selectedIds.includes(l.nodeId));
+                selectedNodes = [];
+                selectedMembers = [];
+                draw();
+            } else if (mode === 'bulk_select' && selectedNodes.length > 0 && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
+                // Copy selected nodes to clipboard
+                clipboardNodes = selectedNodes.map(n => ({...n}));
+            } else if (mode === 'bulk_select' && clipboardNodes.length > 0 && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
+                // Paste nodes with offset
+                saveState();
+                let maxId = Math.max(0, ...nodes.map(n => n.id));
+                const offset = 30;
+                const newNodes = clipboardNodes.map(n => ({...n, id: ++maxId, x: n.x + offset, y: n.y + offset}));
+                nodes = nodes.concat(newNodes);
+                selectedNodes = newNodes;
+                draw();
+            }
+        });
+
+        // --- Mode Switching & UI ---
+        const modeButtons = document.querySelectorAll('.mode-btn');
+        modeButtons.forEach(btn => {
+            btn.addEventListener('click', () => {
+                mode = btn.id.replace('btn-', '').replace(/-/g, '_');
+                modeButtons.forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                startMemberNode = null;
+                isSelecting = (mode === 'bulk_select');
+                selectionRect = null;
+                selectedNodes = [];
+                selectedMembers = [];
+                updateStatus();
+                draw();
+            });
+        });
+        
+        const orthoBtn = document.getElementById('btn-ortho-snap');
+        orthoBtn.addEventListener('click', () => {
+            isOrthoOn = !isOrthoOn;
+            orthoBtn.classList.toggle('active', isOrthoOn);
+            orthoBtn.textContent = `Ortho Snap (${isOrthoOn ? 'ON' : 'OFF'})`;
+            updateStatus();
+        });
+
+        function updateStatus() {
+            let message = "Ready.";
+            switch (mode) {
+                case 'add_nodes': message = isOrthoOn && nodes.length > 0 ? `Click to add node (Ortho ON).` : "Click to add a node."; break;
+                case 'add_members': message = startMemberNode ? `Member from Node ${startMemberNode.id}. Click end node.` : "Click first node of member."; break;
+                case 'delete': message = "Click any node or member to delete."; break;
+                case 'add_pinned': message = "Click a node to set a Pinned Support."; break;
+                case 'add_roller': message = "Click a node to set a Roller Support."; break;
+                case 'add_load': message = "Click a node to apply a load."; break;
+            }
+            statusEl.innerHTML = message + "<br>Wheel to zoom, Middle-click to pan.";
+        }
+        
+        document.getElementById('btn-add-nodes').classList.add('active');
+
+        // --- Coordinate Transformation ---
+        function screenToWorld(sx, sy) {
+            // Y axis increases upward from center
+            return { x: (sx - origin.x) / scale, y: -(sy - origin.y) / scale };
+        }
+
+        function worldToScreen(wx, wy) {
+            // Convert world (math) coordinates to screen (canvas) coordinates
+            return {
+                x: origin.x + wx * scale,
+                y: origin.y - wy * scale
+            };
+        }
+
+        // --- Core Drawing Logic ---
+        function draw() {
+            ctx.save();
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.translate(origin.x, origin.y);
+            ctx.scale(scale, scale);
+            ctx.scale(1, -1); // Flip Y axis upward
+
+            drawAxes();
+            drawGrid();
+            drawMembers();
+            if (analysisResults) {
+                drawReactionForces();
+            }
+            drawSupports();
+            drawLoads();
+            drawLoadedAreas();
+            drawSelection();
+            drawNodes();
+            
+            // Draw axis highlight for add_angled_member
+            if (mode === 'add_angled_member' && startMemberNode && !axisSelection && axisValue !== null) {
+                ctx.save();
+                ctx.strokeStyle = '#ff9800';
+                ctx.lineWidth = 3 / scale;
+                if (axisSelection === 'X') {
+                    ctx.beginPath();
+                    ctx.moveTo(-10000, axisValue);
+                    ctx.lineTo(10000, axisValue);
+                    ctx.stroke();
+                } else if (axisSelection === 'Y') {
+                    ctx.beginPath();
+                    ctx.moveTo(axisValue, -10000);
+                    ctx.lineTo(axisValue, 10000);
+                    ctx.stroke();
+                }
+                ctx.restore();
+            }
+            // Draw preview line
+            if (previewLine) {
+                ctx.save();
+                ctx.strokeStyle = '#00bcd4';
+                ctx.setLineDash([10 / scale, 10 / scale]);
+                ctx.lineWidth = 2 / scale;
+                ctx.beginPath();
+                ctx.moveTo(previewLine.x0, previewLine.y0);
+                ctx.lineTo(previewLine.x1, previewLine.y1);
+                ctx.stroke();
+                ctx.restore();
+            }
+            
+            ctx.restore();
+        }
+        
+        function drawAxes() {
+            const view = {
+                x: -origin.x / scale, y: -origin.y / scale,
+                w: canvas.width / scale, h: canvas.height / scale
+            };
+            const minX = view.x, maxX = view.x + view.w;
+            const minY = view.y, maxY = view.y + view.h;
+            ctx.save();
+            ctx.lineWidth = 2 / scale;
+            // X axis
+            ctx.strokeStyle = '#222';
+            ctx.beginPath();
+            ctx.moveTo(minX, 0);
+            ctx.lineTo(maxX, 0);
+            ctx.stroke();
+            // Y axis
+            ctx.beginPath();
+            ctx.moveTo(0, minY);
+            ctx.lineTo(0, maxY);
+            ctx.stroke();
+
+            // --- Dynamic tick step based on zoom ---
+            let pxPerGrid = grid_size * scale;
+            let majorStep = 5 * grid_size;
+            if (pxPerGrid < 20) {
+                // If grid lines are too close, increase step
+                let exp = Math.ceil(Math.log10(40 / scale));
+                majorStep = Math.pow(10, exp);
+            } else if (pxPerGrid > 100) {
+                // If grid lines are too far, decrease step
+                let exp = Math.floor(Math.log10(40 / scale));
+                majorStep = Math.max(grid_size, Math.pow(10, exp));
+            }
+            // Minor ticks every grid_size, major every majorStep
+            ctx.lineWidth = 1 / scale;
+            for (let x = Math.floor(minX / grid_size) * grid_size; x < maxX; x += grid_size) {
+                ctx.beginPath();
+                let isMajor = (Math.abs(x % majorStep) < 1e-6);
+                ctx.strokeStyle = isMajor ? '#222' : '#888';
+                let tickLen = isMajor ? 16 / scale : 8 / scale;
+                ctx.moveTo(x, -tickLen / 2);
+                ctx.lineTo(x, tickLen / 2);
+                ctx.stroke();
+                if (isMajor && Math.abs(x) > 1e-6) {
+                    const scr = worldToScreen(x + 2 / scale, -12 / scale / scale);
+                    ctx.save();
+                    ctx.setTransform(1, 0, 0, 1, 0, 0);
+                    ctx.font = `${Math.max(10, 10 / scale)}px Arial`;
+                    ctx.fillStyle = '#222';
+                    ctx.fillText(formatAxisNumber(x), scr.x, scr.y);
+                    ctx.restore();
+                }
+            }
+            for (let y = Math.floor(minY / grid_size) * grid_size; y < maxY; y += grid_size) {
+                ctx.beginPath();
+                let isMajor = (Math.abs(y % majorStep) < 1e-6);
+                ctx.strokeStyle = isMajor ? '#222' : '#888';
+                let tickLen = isMajor ? 16 / scale : 8 / scale;
+                ctx.moveTo(-tickLen / 2, y);
+                ctx.lineTo(tickLen / 2, y);
+                ctx.stroke();
+                if (isMajor && Math.abs(y) > 1e-6) {
+                    const scr = worldToScreen(4 / scale, y - 4 / scale);
+                    ctx.save();
+                    ctx.setTransform(1, 0, 0, 1, 0, 0);
+                    ctx.font = `${Math.max(10, 10 / scale)}px Arial`;
+                    ctx.fillStyle = '#222';
+                    ctx.fillText(formatAxisNumber(y), scr.x, scr.y);
+                    ctx.restore();
+                }
+            }
+            // Draw origin marker
+            ctx.beginPath();
+            ctx.arc(0, 0, 6 / scale, 0, 2 * Math.PI);
+            ctx.fillStyle = '#ff5722';
+            ctx.fill();
+            ctx.restore();
+        }
+
+        function formatAxisNumber(val) {
+            if (Math.abs(val) < 1e-2 || Math.abs(val) > 1e4) {
+                return val.toExponential(1);
+            } else {
+                return val.toFixed(0);
+            }
+        }
+
+        function drawGrid() {
+            // Draw grid lines with different colors for 10, 50, 100 multiples
+            const view = {
+                x: -origin.x / scale, y: -origin.y / scale,
+                w: canvas.width / scale, h: canvas.height / scale
+            };
+            const startX = Math.floor(view.x / grid_size) * grid_size;
+            const endX = startX + view.w + grid_size;
+            const startY = Math.floor(view.y / grid_size) * grid_size;
+            const endY = startY + view.h + grid_size;
+
+            for (let x = startX; x < endX; x += grid_size) {
+                ctx.beginPath();
+                let color = '#e0e0e0';
+                let width = 1 / scale;
+                if (x % 100 === 0) { color = '#b0b0b0'; width = 2 / scale; }
+                else if (x % 50 === 0) { color = '#cfd8dc'; width = 1.5 / scale; }
+                ctx.strokeStyle = color;
+                ctx.lineWidth = width;
+                ctx.moveTo(x, view.y);
+                ctx.lineTo(x, view.y + view.h);
+                ctx.stroke();
+            }
+            for (let y = startY; y < endY; y += grid_size) {
+                ctx.beginPath();
+                let color = '#e0e0e0';
+                let width = 1 / scale;
+                if (y % 100 === 0) { color = '#b0b0b0'; width = 2 / scale; }
+                else if (y % 50 === 0) { color = '#cfd8dc'; width = 1.5 / scale; }
+                ctx.strokeStyle = color;
+                ctx.lineWidth = width;
+                ctx.moveTo(view.x, y);
+                ctx.lineTo(view.x + view.w, y);
+                ctx.stroke();
+            }
+        }
+
+        function drawNodes() {
+            nodes.forEach(node => {
+                ctx.beginPath(); ctx.arc(node.x, node.y, node_radius / scale, 0, 2 * Math.PI);
+                ctx.fillStyle = (startMemberNode && startMemberNode.id === node.id) ? '#ffc107' : '#007bff';
+                ctx.fill();
+                // Draw node number upright
+                const scr = worldToScreen(node.x + 8 / scale, node.y - 8 / scale);
+                ctx.save();
+                ctx.setTransform(1, 0, 0, 1, 0, 0);
+                ctx.font = `${Math.max(10, 12 / scale)}px Arial`;
+                ctx.fillStyle = "black";
+                ctx.fillText(node.id, scr.x, scr.y);
+                ctx.restore();
+            });
+        }
+        
+        function drawMembers() {
+            const maxForce = analysisResults ? Math.max(1, ...analysisResults.memberForces.map(mf => Math.abs(mf.force))) : 1;
+            members.forEach((member, index) => {
+                const start = nodes.find(n => n.id === member.startNode);
+                const end = nodes.find(n => n.id === member.endNode);
+                if (start && end) {
+                    ctx.beginPath(); ctx.moveTo(start.x, start.y); ctx.lineTo(end.x, end.y);
+                    let color = '#6c757d', label = '';
+                    if (analysisResults) {
+                        const result = analysisResults.memberForces.find(mf => mf.memberIndex === index);
+                        const force = result ? result.force : 0;
+                        if (force < -1e-6) { color = `rgba(220, 53, 69, ${Math.min(1, 0.2 + Math.abs(force) / maxForce * 0.8)})`; label = `${force.toFixed(1)}(C)`; } 
+                        else if (force > 1e-6) { color = `rgba(0, 123, 255, ${Math.min(1, 0.2 + Math.abs(force) / maxForce * 0.8)})`; label = `${force.toFixed(1)}(T)`; } 
+                        else { color = '#adb5bd'; label = '0.0'; }
+                    }
+                    ctx.strokeStyle = color; ctx.lineWidth = (analysisResults ? 5 : 2) / scale; ctx.stroke();
+                    // Draw label upright at midpoint
+                    const mx = (start.x + end.x) / 2;
+                    const my = (start.y + end.y) / 2;
+                    const scr = worldToScreen(mx, my + 5 / scale);
+                    const length = Math.sqrt((end.x - start.x) ** 2 + (end.y - start.y) ** 2);
+                    ctx.save();
+                    ctx.setTransform(1, 0, 0, 1, 0, 0);
+                    ctx.font = `${Math.max(14, 16 / scale)}px Arial`;
+                    ctx.fillStyle = 'black';
+                    let text = label;
+                    if (length > 0) text += `  L=${length.toFixed(2)}`;
+                    ctx.fillText(text, scr.x, scr.y);
+                    ctx.restore();
+                }
+            });
+        }
+        
+        function drawSupports() {
+            const size = 15 / scale;
+            supports.forEach(support => {
+                const node = nodes.find(n => n.id === support.nodeId);
+                if (node) {
+                    ctx.save();
+                    ctx.scale(1, -1);
+                    ctx.fillStyle = 'purple'; ctx.strokeStyle = 'purple'; ctx.lineWidth = 2 / scale;
+                    if (support.type === 'pinned') {
+                        ctx.beginPath(); ctx.moveTo(node.x, -node.y); ctx.lineTo(node.x - size, -node.y - size * 1.2); ctx.lineTo(node.x + size, -node.y - size * 1.2); ctx.closePath(); ctx.fill();
+                    } else if (support.type === 'roller') {
+                        ctx.beginPath(); ctx.arc(node.x, -node.y - size/2, size/2, 0, 2 * Math.PI); ctx.stroke();
+                        ctx.beginPath(); ctx.moveTo(node.x - size, -node.y - size); ctx.lineTo(node.x + size, -node.y - size); ctx.stroke();
+                    }
+                    ctx.restore();
+                    // Show reaction value if available
+                    if (analysisResults && analysisResults.reactions && analysisResults.reactions[support.nodeId]) {
+                        const rx = analysisResults.reactions[support.nodeId].rx;
+                        const ry = analysisResults.reactions[support.nodeId].ry;
+                        let txt = '';
+                        if (support.type === 'pinned') {
+                            txt += `Rx: ${rx.toFixed(2)}  Ry: ${ry.toFixed(2)}`;
+                        } else if (support.type === 'roller') {
+                            txt += `Ry: ${ry.toFixed(2)}`;
+                            if (Math.abs(rx) > 1e-6) txt += ` Rx: ${rx.toFixed(2)}`;
+                        }
+                        const scr = worldToScreen(node.x + 18 / scale, node.y - 8 / scale);
+                        ctx.save();
+                        ctx.setTransform(1, 0, 0, 1, 0, 0);
+                        ctx.font = `${Math.max(10, 12 / scale)}px Arial`;
+                        ctx.fillStyle = '#28a745';
+                        ctx.fillText(txt, scr.x, scr.y);
+                        ctx.restore();
+                    }
+                }
+            });
+        }
+        
+        function drawLoads() {
+            loads.forEach(load => {
+                const node = nodes.find(n => n.id === load.nodeId);
+                if (node) {
+                    const length = 50 / scale;
+                    const angle = Math.atan2(load.fy, load.fx);
+                    const endX = node.x + length * Math.cos(angle);
+                    const endY = node.y + length * Math.sin(angle);
+                    ctx.strokeStyle = '#dc3545'; ctx.lineWidth = 2/scale; ctx.fillStyle = '#dc3545';
+                    ctx.beginPath(); ctx.moveTo(node.x, node.y); ctx.lineTo(endX, endY); ctx.stroke();
+                    ctx.save(); ctx.translate(endX, endY); ctx.rotate(angle);
+                    const headSize = 10 / scale;
+                    ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(-headSize, headSize/2); ctx.lineTo(-headSize, -headSize/2); ctx.closePath(); ctx.fill(); ctx.restore();
+                    // Show load value
+                    const scr = worldToScreen(node.x + length * Math.cos(angle) * 0.6, node.y + length * Math.sin(angle) * 0.6);
+                    ctx.save();
+                    ctx.setTransform(1, 0, 0, 1, 0, 0);
+                    ctx.font = `${Math.max(10, 12 / scale)}px Arial`;
+                    ctx.fillStyle = '#dc3545';
+                    ctx.fillText(`Fx:${load.fx}, Fy:${load.fy}`, scr.x, scr.y);
+                    ctx.restore();
+                }
+            });
+        }
+
+        function drawReactionForces() {
+             const reactions = analysisResults.reactions;
+             Object.keys(reactions).forEach(nodeId => {
+                const node = nodes.find(n => n.id == nodeId);
+                const reaction = reactions[nodeId];
+                if (node) {
+                    ctx.strokeStyle = '#28a745'; ctx.lineWidth = 2/scale; ctx.fillStyle = '#28a745';
+                    const length = 50 / scale;
+                    const headSize = 10 / scale;
+                    if (Math.abs(reaction.rx) > 1e-6) {
+                        const angle = reaction.rx > 0 ? Math.PI : 0;
+                        const startX = node.x + length * Math.cos(angle);
+                        ctx.beginPath(); ctx.moveTo(startX, node.y); ctx.lineTo(node.x, node.y); ctx.stroke();
+                        ctx.save(); ctx.translate(startX, node.y); ctx.rotate(angle);
+                        ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(-headSize, headSize/2); ctx.lineTo(-headSize, -headSize/2); ctx.closePath(); ctx.fill(); ctx.restore();
+                    }
+                    if (Math.abs(reaction.ry) > 1e-6) {
+                        const angle = reaction.ry > 0 ? -Math.PI/2 : Math.PI/2;
+                        const startY = node.y + length * Math.sin(angle);
+                        ctx.beginPath(); ctx.moveTo(node.x, startY); ctx.lineTo(node.x, node.y); ctx.stroke();
+                        ctx.save(); ctx.translate(node.x, startY); ctx.rotate(angle);
+                        ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(-headSize, headSize/2); ctx.lineTo(-headSize, -headSize/2); ctx.closePath(); ctx.fill(); ctx.restore();
+                    }
+                }
+             });
+        }
+
+        function drawLoadedAreas() {
+            loads.forEach(load => {
+                const node = nodes.find(n => n.id === load.nodeId);
+                if (node) {
+                    ctx.save();
+                    ctx.beginPath();
+                    ctx.arc(node.x, node.y, 18 / scale, 0, 2 * Math.PI);
+                    ctx.fillStyle = 'rgba(220,53,69,0.12)';
+                    ctx.fill();
+                    ctx.restore();
+                }
+            });
+        }
+
+        function drawSelection() {
+            if (selectionRect) {
+                ctx.save();
+                ctx.strokeStyle = '#007bff';
+                ctx.setLineDash([8 / scale, 8 / scale]);
+                ctx.lineWidth = 2 / scale;
+                ctx.strokeRect(selectionRect.x, selectionRect.y, selectionRect.w, selectionRect.h);
+                ctx.restore();
+            }
+            selectedNodes.forEach(node => {
+                ctx.save();
+                ctx.beginPath();
+                ctx.arc(node.x, node.y, 12 / scale, 0, 2 * Math.PI);
+                ctx.strokeStyle = '#007bff';
+                ctx.lineWidth = 3 / scale;
+                ctx.stroke();
+                ctx.restore();
+            });
+            selectedMembers.forEach(member => {
+                const start = nodes.find(n => n.id === member.startNode);
+                const end = nodes.find(n => n.id === member.endNode);
+                if (start && end) {
+                    ctx.save();
+                    ctx.strokeStyle = '#007bff';
+                    ctx.lineWidth = 6 / scale;
+                    ctx.globalAlpha = 0.3;
+                    ctx.beginPath();
+                    ctx.moveTo(start.x, start.y);
+                    ctx.lineTo(end.x, end.y);
+                    ctx.stroke();
+                    ctx.globalAlpha = 1.0;
+                    ctx.restore();
+                }
+            });
+        }
+
+        // --- Event Handling ---
+        let selectStart = null;
+        canvas.addEventListener('mousedown', e => {
+            if (mode === 'bulk_select' && e.button === 0) {
+                const worldPos = screenToWorld(e.clientX - canvas.getBoundingClientRect().left, e.clientY - canvas.getBoundingClientRect().top);
+                // If click is on a selected node, start dragging selection
+                let clickedSelected = false;
+                for (const node of selectedNodes) {
+                    const dist = Math.sqrt((node.x - worldPos.x) ** 2 + (node.y - worldPos.y) ** 2);
+                    if (dist < 15 / scale) {
+                        isDraggingSelection = true;
+                        dragStart = worldPos;
+                        dragOffset = selectedNodes.map(n => ({ id: n.id, x: n.x, y: n.y }));
+                        canvas.style.cursor = 'move';
+                        clickedSelected = true;
+                        break;
+                    }
+                }
+                if (!clickedSelected) {
+                    // Start new selection rectangle
+                    selectStart = worldPos;
+                    selectionRect = { x: worldPos.x, y: worldPos.y, w: 0, h: 0 };
+                    selectedNodes = [];
+                    selectedMembers = [];
+                    draw();
+                }
+                return;
+            }
+            saveState();
+            if (e.button === 1) { // Middle mouse button
+                isPanning = true;
+                panStart.x = e.clientX;
+                panStart.y = e.clientY;
+                canvas.style.cursor = 'grabbing';
+                e.preventDefault();
+            }
+        });
+        canvas.addEventListener('mousemove', e => {
+            if (isPanning) {
+                const dx = e.clientX - panStart.x;
+                const dy = e.clientY - panStart.y;
+                origin.x += dx;
+                origin.y += dy;
+                panStart.x = e.clientX;
+                panStart.y = e.clientY;
+                draw();
+            }
+            if (mode === 'bulk_select' && selectStart) {
+                const worldPos = screenToWorld(e.clientX - canvas.getBoundingClientRect().left, e.clientY - canvas.getBoundingClientRect().top);
+                selectionRect = {
+                    x: Math.min(selectStart.x, worldPos.x),
+                    y: Math.min(selectStart.y, worldPos.y),
+                    w: Math.abs(worldPos.x - selectStart.x),
+                    h: Math.abs(worldPos.y - selectStart.y)
+                };
+                selectedNodes = nodes.filter(n => n.x >= selectionRect.x && n.x <= selectionRect.x + selectionRect.w && n.y >= selectionRect.y && n.y <= selectionRect.y + selectionRect.h);
+                selectedMembers = members.filter(m => {
+                    const n1 = nodes.find(n => n.id === m.startNode);
+                    const n2 = nodes.find(n => n.id === m.endNode);
+                    if (!n1 || !n2) return false;
+                    return (n1.x >= selectionRect.x && n1.x <= selectionRect.x + selectionRect.w && n1.y >= selectionRect.y && n1.y <= selectionRect.y + selectionRect.h &&
+                            n2.x >= selectionRect.x && n2.x <= selectionRect.x + selectionRect.w && n2.y >= selectionRect.y && n2.y <= selectionRect.y + selectionRect.h);
+                });
+                draw();
+            }
+            if (isDraggingSelection && dragStart) {
+                const worldPos = screenToWorld(e.clientX - canvas.getBoundingClientRect().left, e.clientY - canvas.getBoundingClientRect().top);
+                const dx = worldPos.x - dragStart.x;
+                const dy = worldPos.y - dragStart.y;
+                selectedNodes.forEach((node, i) => {
+                    node.x = dragOffset[i].x + dx;
+                    node.y = dragOffset[i].y + dy;
+                });
+                draw();
+            }
+        });
+        canvas.addEventListener('mouseup', e => {
+            if (e.button === 1) {
+                isPanning = false;
+                canvas.style.cursor = 'crosshair';
+            }
+            if (mode === 'bulk_select' && selectStart) {
+                selectStart = null;
+                draw();
+            }
+            if (isDraggingSelection) {
+                isDraggingSelection = false;
+                dragStart = null;
+                dragOffset = null;
+                canvas.style.cursor = 'crosshair';
+                draw();
+            }
+        });
+
+        canvas.addEventListener('wheel', e => {
+            e.preventDefault();
+            const zoomIntensity = 0.1;
+            const wheel = e.deltaY < 0 ? 1 : -1;
+            const zoom = Math.exp(wheel * zoomIntensity);
+
+            const rect = canvas.getBoundingClientRect();
+            const mouseX = e.clientX - rect.left;
+            const mouseY = e.clientY - rect.top;
+
+            const worldPosBefore = screenToWorld(mouseX, mouseY);
+            scale *= zoom;
+            const worldPosAfter = screenToWorld(mouseX, mouseY);
+            
+            origin.x += (worldPosAfter.x - worldPosBefore.x) * scale;
+            origin.y += (worldPosAfter.y - worldPosBefore.y) * scale;
+            
+            draw();
+        });
+
+
+        canvas.addEventListener('click', (e) => {
+            if (e.button !== 0) return; // Only handle left clicks
+            const worldPos = screenToWorld(e.clientX - canvas.getBoundingClientRect().left, e.clientY - canvas.getBoundingClientRect().top);
+            
+            analysisResults = null;
+            saveState();
+
+            if (mode === 'add_nodes') {
+                let x = Math.round(worldPos.x / grid_size) * grid_size;
+                let y = Math.round(worldPos.y / grid_size) * grid_size;
+                if(isOrthoOn && nodes.length > 0) {
+                    const lastNode = nodes[nodes.length - 1];
+                    if (Math.abs(x - lastNode.x) < Math.abs(y - lastNode.y)) { x = lastNode.x; } else { y = lastNode.y; }
+                }
+                nodes.push({ id: nextNodeId++, x: x, y: y });
+            } else {
+                const nearestNode = getNearestNode(worldPos.x, worldPos.y);
+                if (nearestNode) { handleNodeClick(nearestNode); } 
+                else if (mode === 'delete') { handleMemberClick(worldPos.x, worldPos.y); }
+            }
+            updateStatus();
+            draw();
+        });
+        
+        function getNearestNode(wx, wy) {
+            let closestNode = null; let minDistance = click_tolerance / scale;
+            nodes.forEach(node => {
+                const dist = Math.sqrt((node.x - wx)**2 + (node.y - wy)**2);
+                if (dist < minDistance) { minDistance = dist; closestNode = node; }
+            });
+            return closestNode;
+        }
+
+        function handleMemberClick(wx, wy) {
+            saveState();
+            let memberToDelete = -1;
+            members.forEach((member, index) => {
+                const start = nodes.find(n => n.id === member.startNode); const end = nodes.find(n => n.id === member.endNode);
+                if (!start || !end) return;
+                const dx = end.x - start.x; const dy = end.y - start.y; const lenSq = dx*dx + dy*dy;
+                const t = Math.max(0, Math.min(1, ((wx - start.x) * dx + (wy - start.y) * dy) / lenSq));
+                const projX = start.x + t * dx; const projY = start.y + t * dy;
+                const dist = Math.sqrt((wx - projX)**2 + (wy - projY)**2);
+                if (dist < (click_tolerance / 2) / scale) { memberToDelete = index; }
+            });
+            if (memberToDelete > -1) { members.splice(memberToDelete, 1); }
+        }
+        
+        function handleNodeClick(node) {
+            saveState();
+            switch (mode) {
+                case 'add_members':
+                    if (startMemberNode) {
+                        if (startMemberNode.id !== node.id && !members.some(m => (m.startNode === startMemberNode.id && m.endNode === node.id) || (m.startNode === node.id && m.endNode === startMemberNode.id))) {
+                            // Prompt for member length
+                            const n1 = startMemberNode;
+                            const n2 = node;
+                            const dx = n2.x - n1.x;
+                            const dy = n2.y - n1.y;
+                            const defaultLen = Math.sqrt(dx*dx + dy*dy).toFixed(2);
+                            const lenInput = prompt(`Enter member length (leave blank for direct connection):`, defaultLen);
+                            let useLength = parseFloat(lenInput);
+                            if (!isNaN(useLength) && useLength > 0) {
+                                // Place a new node at the specified length in the direction of n2
+                                const angle = Math.atan2(dy, dx);
+                                const newX = n1.x + useLength * Math.cos(angle);
+                                const newY = n1.y + useLength * Math.sin(angle);
+                                const newNodeId = nextNodeId++;
+                                nodes.push({ id: newNodeId, x: newX, y: newY });
+                                members.push({ startNode: n1.id, endNode: newNodeId });
+                            } else {
+                                members.push({ startNode: startMemberNode.id, endNode: node.id });
+                            }
+                        }
+                        startMemberNode = null;
+                    } else { startMemberNode = node; }
+                    break;
+                case 'delete':
+                    nodes = nodes.filter(n => n.id !== node.id);
+                    members = members.filter(m => m.startNode !== node.id && m.endNode !== node.id);
+                    supports = supports.filter(s => s.nodeId !== node.id);
+                    loads = loads.filter(l => l.nodeId !== node.id);
+                    break;
+                case 'add_pinned': case 'add_roller':
+                    const supportType = mode === 'add_pinned' ? 'pinned' : 'roller';
+                    const sIndex = supports.findIndex(s => s.nodeId === node.id);
+                    if (sIndex > -1) {
+                        if (supports[sIndex].type === supportType) { supports.splice(sIndex, 1); } 
+                        else { supports[sIndex].type = supportType; }
+                    } else { supports.push({ nodeId: node.id, type: supportType }); }
+                    break;
+                case 'add_load':
+                    const existingLoad = loads.find(l => l.nodeId === node.id);
+                    const fx_in = prompt(`Enter Fx component for Node ${node.id}:`, existingLoad ? existingLoad.fx : "0");
+                    if (fx_in === null) break;
+                    const fy_in = prompt(`Enter Fy component for Node ${node.id}:`, existingLoad ? existingLoad.fy : "-10");
+                    if (fy_in === null) break;
+                    const fx = parseFloat(fx_in) || 0; const fy = parseFloat(fy_in) || 0;
+                    const lIndex = loads.findIndex(l => l.nodeId === node.id);
+                    if (lIndex > -1) { loads.splice(lIndex, 1); }
+                    if (fx !== 0 || fy !== 0) { loads.push({nodeId: node.id, fx, fy}); }
+                    break;
+            }
+        }
+        
+        // --- Action Buttons ---
+        document.getElementById('btn-clear').addEventListener('click', () => {
+            saveState();
+            nodes = []; members = []; supports = []; loads = [];
+            nextNodeId = 1; startMemberNode = null; analysisResults = null;
+            // Show only origin to right 50 units
+            scale = canvas.width / 50;
+            origin = { x: 0, y: canvas.height / 2 };
+            updateStatus(); draw();
+        });
+        
+        document.getElementById('btn-solve').addEventListener('click', async () => {
+            if (nodes.length < 2 || members.length < 1) { statusEl.textContent = "Error: Add at least 2 nodes and 1 member."; return; }
+            statusEl.textContent = "Solving...";
+            const data = {
+                nodes: nodes,
+                members: members, supports: supports, loads: loads
+            };
+            const response = await fetch('/solve_truss', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+            if(response.ok) {
+                analysisResults = await response.json();
+                statusEl.textContent = "Analysis complete. Results are shown on the canvas.";
+            } else {
+                const error = await response.json();
+                statusEl.textContent = `Error: ${error.error || "Analysis failed."}`;
+                analysisResults = null;
+            }
+            draw();
+        });
+
+        // Export truss as JSON
+        document.getElementById('btn-export').addEventListener('click', () => {
+            const trussData = {
+                nodes,
+                members,
+                supports,
+                loads,
+                nextNodeId
+            };
+            const blob = new Blob([JSON.stringify(trussData, null, 2)], {type: 'application/json'});
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'truss.json';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        });
+
+        // Import truss from JSON (paste dialog)
+        document.getElementById('btn-import').addEventListener('click', async () => {
+            const input = prompt('Paste exported truss JSON here:');
+            if (!input) return;
+            try {
+                const trussData = JSON.parse(input);
+                nodes = trussData.nodes || [];
+                members = trussData.members || [];
+                supports = trussData.supports || [];
+                loads = trussData.loads || [];
+                nextNodeId = trussData.nextNodeId || (nodes.length ? Math.max(...nodes.map(n => n.id)) + 1 : 1);
+                startMemberNode = null;
+                analysisResults = null;
+                selectedNodes = [];
+                selectedMembers = [];
+                updateStatus();
+                draw();
+            } catch (e) {
+                alert('Invalid truss JSON!');
+            }
+        });
+
+        // --- Initial Setup ---
+        function resizeCanvas() {
+            const container = document.getElementById('main-content');
+            canvas.width = container.clientWidth - 40;
+            canvas.height = container.clientHeight - 40;
+            // Show only origin to right 50 units
+            scale = canvas.width / 50;
+            origin = { x: 0, y: canvas.height / 2 };
+            draw();
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+        updateStatus();
+        draw();
+    </script>
+</body>
+</html>
